@@ -66,7 +66,6 @@ def get_trade_signal(data, verbose=False):
         print(f"⚠️ Not enough data rows: {len(data)} — {e}")
         return 'HOLD'
 
-
     ema_up = previous['EMA_9'] < previous['SMA_50'] and current['EMA_9'] > current['SMA_50']
     ema_down = previous['EMA_9'] > previous['SMA_50'] and current['EMA_9'] < current['SMA_50']
     rsi = current['RSI']
@@ -79,14 +78,18 @@ def get_trade_signal(data, verbose=False):
     atr = current['ATR']
     roc = current['ROC']
 
-    atr_threshold = 0.5
-    roc_threshold = 0.3
+    # ATR is a dollar figure, so a fixed 0.5 threshold meant wildly different
+    # things on F ($12) vs SPY ($600). Normalize to percent-of-price so the
+    # volatility gate behaves consistently across the whole universe.
+    atr_pct = (atr / price) * 100 if price else 0.0
+    atr_pct_threshold = 0.15   # ~0.15% of price per bar; tune to taste
+    roc_threshold = 0.3        # ROCIndicator already returns a percent
 
     buy_score = 0
     if ema_up: buy_score += 1.0
     if hammer: buy_score += 0.5
     if rsi < 50: buy_score += 0.5
-    if atr > atr_threshold: buy_score += 0.5
+    if atr_pct > atr_pct_threshold: buy_score += 0.5
     if roc > roc_threshold: buy_score += 0.5
     if price > support * 1.01: buy_score += 0.5
 
@@ -94,13 +97,13 @@ def get_trade_signal(data, verbose=False):
     if ema_down: sell_score += 1.0
     if shooting_star: sell_score += 0.5
     if rsi > 60: sell_score += 0.5
-    if atr > atr_threshold: sell_score += 0.5
+    if atr_pct > atr_pct_threshold: sell_score += 0.5
     if roc < -roc_threshold: sell_score += 0.5
     if price < resistance * 0.99: sell_score += 0.5
 
     if verbose:
-        print(f"🧪 BUY Score: {buy_score:.2f} | EMA_up: {ema_up} | Hammer: {hammer} | RSI: {rsi:.2f} | ATR: {atr:.2f} | ROC: {roc:.2f}")
-        print(f"🧪 SELL Score: {sell_score:.2f} | EMA_down: {ema_down} | Shooting Star: {shooting_star} | RSI: {rsi:.2f} | ATR: {atr:.2f} | ROC: {roc:.2f}")
+        print(f"🧪 BUY Score: {buy_score:.2f} | EMA_up: {ema_up} | Hammer: {hammer} | RSI: {rsi:.2f} | ATR%: {atr_pct:.3f} | ROC: {roc:.2f}")
+        print(f"🧪 SELL Score: {sell_score:.2f} | EMA_down: {ema_down} | Shooting Star: {shooting_star} | RSI: {rsi:.2f} | ATR%: {atr_pct:.3f} | ROC: {roc:.2f}")
         print("-" * 100)
 
     if buy_score >= 2.5:

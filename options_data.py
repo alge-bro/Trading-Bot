@@ -1,48 +1,42 @@
 #options_data.py
-import os
-import json
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
 
-POSITIONS_FILE = "positions.json"
+# NOTE: load_positions / save_positions used to live here AND in
+# sell_checker.py. They now live in positions.py (one source of truth).
+# Removed from this file: get_option_chain (unused), and get_iv_percentile
+# (it didn't compute implied volatility at all — it returned the percentile
+# of the latest absolute daily return — and nothing called it).
 
-def load_positions():
-    if os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
 
-def save_positions(positions):
-    with open(POSITIONS_FILE, 'w') as f:
-        json.dump(positions, f, indent=4)
-
-def get_option_chain(symbol):
-    ticker = yf.Ticker(symbol)
-    expirations = ticker.options
-    nearest_exp = expirations[0]
-    options = ticker.option_chain(nearest_exp).calls
-    options['expiration'] = nearest_exp
-    return options
-
-def get_iv_percentile(symbol, days=30):
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period=f"{days}d", interval="1d")
-    if hist.empty:
-        return None
-    iv_values = hist['Close'].pct_change().abs().dropna()
-    current_iv = iv_values.iloc[-1]
-    percentile = (iv_values < current_iv).sum() / len(iv_values)
-    return percentile
-
-def is_near_earnings(symbol):
-    ticker = yf.Ticker(symbol)
+def is_near_earnings(symbol, within_days=5):
+    """True if earnings fall within `within_days`. Handy as a gamma-risk
+    gate. Not wired in by default — to use it, early-return None from
+    pick_option/pick_put_option when this is True.
+    Handles both the new (dict) and legacy (DataFrame) yfinance calendar."""
     try:
-        cal = ticker.calendar
-        earnings_date = pd.to_datetime(cal.loc['Earnings Date'][0])
-        return (earnings_date - pd.Timestamp.now()).days <= 5
-    except:
+        cal = yf.Ticker(symbol).calendar
+        if isinstance(cal, dict):
+            dates = cal.get('Earnings Date') or []
+            earnings_date = pd.to_datetime(dates[0]) if dates else None
+        else:  # legacy DataFrame layout
+            earnings_date = pd.to_datetime(cal.loc['Earnings Date'][0])
+        if earnings_date is None:
+            return False
+        return 0 <= (earnings_date - pd.Timestamp.now()).days <= within_days
+    except Exception:
         return False
+
+
+def _pick_expiration(expirations, min_days=3):
+    today = datetime.today().date()
+    return next(
+        (exp for exp in expirations
+         if (datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= min_days),
+        expirations[-1]
+    )
+
 
 def _filter_and_score_options(df, current_price):
     df['spread'] = df['ask'] - df['bid']
@@ -81,57 +75,34 @@ def _filter_and_score_options(df, current_price):
         'score': round(best_option['score'], 3)
     }
 
-def pick_option(symbol, current_price):
+
+def _pick(symbol, current_price, side):
+    """side: 'calls' or 'puts'. Shared body for the two public functions."""
     try:
         stock = yf.Ticker(symbol)
         expirations = stock.options
-
         if not expirations:
             print(f"❌ No expiration dates found for {symbol}")
             return None
 
-        today = datetime.today().date()
-        expiration = next(
-            (exp for exp in expirations if (datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 3),
-            expirations[-1]
-        )
+        expiration = _pick_expiration(expirations)
+        chain = stock.option_chain(expiration)
+        contracts = (chain.calls if side == 'calls' else chain.puts).copy()
+        contracts['expiration'] = expiration
 
-        calls = stock.option_chain(expiration).calls.copy()
-        calls['expiration'] = expiration
-
-        if calls.empty:
-            print(f"❌ No call options found for {symbol} on {expiration}")
+        if contracts.empty:
+            print(f"❌ No {side} found for {symbol} on {expiration}")
             return None
 
-        return _filter_and_score_options(calls, current_price)
+        return _filter_and_score_options(contracts, current_price)
     except Exception as e:
-        print(f"failed to fetch CALL option for {symbol}: {e}")
+        print(f"failed to fetch {side} option for {symbol}: {e}")
         return None
+
+
+def pick_option(symbol, current_price):
+    return _pick(symbol, current_price, 'calls')
 
 
 def pick_put_option(symbol, current_price):
-    try:
-        stock = yf.Ticker(symbol)
-        expirations = stock.options
-
-        if not expirations:
-            print(f"❌ No expiration dates found for {symbol}")
-            return None
-
-        today = datetime.today().date()
-        expiration = next(
-            (exp for exp in expirations if (datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 3),
-            expirations[-1]
-        )
-
-        puts = stock.option_chain(expiration).puts.copy()
-        puts['expiration'] = expiration
-
-        if puts.empty:
-            print(f"❌ No put options found for {symbol} on {expiration}")
-            return None
-
-        return _filter_and_score_options(puts, current_price)
-    except Exception as e:
-        print(f"failed to fetch PUT option for {symbol}: {e}")
-        return None
+    return _pick(symbol, current_price, 'puts')

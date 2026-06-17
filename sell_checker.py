@@ -1,81 +1,76 @@
 # sell_checker.py
-import json
-import os
-import yfinance as yf
 import time
+from datetime import datetime
+import yfinance as yf
+from positions import load_positions, remove_position
 
-POSITIONS_FILE = "positions.json"
-SELL_THRESHOLD = 0.3  # 30% profit target
+# Exit thresholds (fractions of entry premium). TUNE THESE.
+TAKE_PROFIT = 0.30    # +30%: lock in the win
+STOP_LOSS = -0.50     # -50%: cut the loser before theta finishes the job
+MAX_HOLD_HOURS = 6    # time-based exit so nothing rots overnight
 
 
-def safe_fetch_yfinance(fn, *args, retries=3, delay=1):
-    for _ in range(retries):
+def get_option_price(contract_symbol, retries=3, delay=1):
+    """Last traded price for an option contract via yfinance.
+    The retry now wraps the call that actually touches the network
+    (.history) — the old version retried yf.Ticker(), which never fails,
+    so it was guarding the wrong line."""
+    for attempt in range(retries):
         try:
-            return fn(*args)
+            hist = yf.Ticker(contract_symbol).history(period="1d", interval="1m")
+            if not hist.empty:
+                return float(hist['Close'].iloc[-1])
+            return None  # valid contract, just no prints today
         except Exception as e:
-            print(f"[yfinance] Retry due to error: {e}")
+            print(f"[{contract_symbol}] price fetch retry {attempt + 1}/{retries}: {e}")
             time.sleep(delay)
     return None
 
 
-def load_positions():
-    if os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-
-def save_positions(positions):
-    with open(POSITIONS_FILE, 'w') as f:
-        json.dump(positions, f, indent=4)
-
-
-def get_option_price(contract_symbol):
-    option = safe_fetch_yfinance(yf.Ticker, contract_symbol)
-    if not option:
-        return None
-    try:
-        hist = option.history(period="1d", interval="1m")
-        if hist.empty:
-            return None
-        return hist['Close'].iloc[-1]
-    except Exception as e:
-        print(f"Error fetching price for {contract_symbol}: {e}")
-        return None
+def _exit_reason(pos, current_price):
+    pnl = (current_price - pos['entry_price']) / pos['entry_price']
+    if pnl >= TAKE_PROFIT:
+        return "take-profit", pnl
+    if pnl <= STOP_LOSS:
+        return "stop-loss", pnl
+    entry_time = pos.get('entry_time')
+    if entry_time:
+        try:
+            t0 = datetime.fromisoformat(entry_time)
+            held_hours = (datetime.now(t0.tzinfo) - t0).total_seconds() / 3600
+            if held_hours >= MAX_HOLD_HOURS:
+                return "max-hold", pnl
+        except ValueError:
+            pass
+    return None, pnl
 
 
 def check_for_sell_opportunities(send_sms, log_trade):
+    """Alert + bookkeeping only — like execute_trade, this does not submit a
+    real closing order. Place the broker sell HERE before remove_position()
+    if you go live."""
     positions = load_positions()
-    updated_positions = positions.copy()
 
-    for symbol, data in positions.items():
-        contract = data['contract']
-        buy_price = data['last_price']
-        current_price = get_option_price(contract)
-
+    for symbol, pos in list(positions.items()):  # list() so we can mutate as we go
+        current_price = get_option_price(pos['contract'])
         if current_price is None:
             continue
 
-        profit = (current_price - buy_price) / buy_price
-
-        if profit >= SELL_THRESHOLD:
-            message = (f"💵 SELL {symbol} Option:\n"
-                       f"🌟 Target reached!\n"
-                       f"📈 Bought: ${buy_price:.2f} → Now: ${current_price:.2f}\n"
-                       f"📝 Contract: {contract}")
+        reason, pnl = _exit_reason(pos, current_price)
+        if reason:
+            message = (f"💵 SELL {symbol} ({reason}):\n"
+                       f"📈 Bought ${pos['entry_price']:.2f} → Now ${current_price:.2f} "
+                       f"({pnl * 100:+.1f}%)\n"
+                       f"📝 {pos['contract']}")
             send_sms(message)
-            log_trade(symbol, f"SELL ({contract})", current_price)
-            del updated_positions[symbol]  # Remove from active list
+            log_trade(symbol, f"SELL ({pos['contract']}) [{reason}]", current_price)
+            remove_position(symbol)
 
-    save_positions(updated_positions)
-    return updated_positions
 
 def simulate_sell(entry_price, current_price):
-    """
-    Simulates whether we should sell based on a profit threshold.
-    """
+    """Used by the backtest. Now respects both the profit target and the
+    stop-loss, matching live behavior."""
     if entry_price is None or current_price is None:
         return False
-
-    profit = (current_price - entry_price) / entry_price
-    return profit >= SELL_THRESHOLD
+    pnl = (current_price - entry_price) / entry_price
+    return pnl >= TAKE_PROFIT or pnl <= STOP_LOSS
