@@ -1,6 +1,5 @@
 #indicators.py
 import pandas as pd
-import numpy as np
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator, ROCIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -52,7 +51,7 @@ def get_support_resistance(data, window=20):
     resistance = recent['high'].max()
     return support, resistance
 
-def get_trade_signal(data, verbose=False):
+def get_trade_signal(data, verbose=False, threshold=2.5):
     """
     Computes weighted signal score and returns 'BUY_CALL', 'BUY_PUT', or 'HOLD'.
     """
@@ -106,9 +105,9 @@ def get_trade_signal(data, verbose=False):
         print(f"🧪 SELL Score: {sell_score:.2f} | EMA_down: {ema_down} | Shooting Star: {shooting_star} | RSI: {rsi:.2f} | ATR%: {atr_pct:.3f} | ROC: {roc:.2f}")
         print("-" * 100)
 
-    if buy_score >= 2.5:
+    if buy_score >= threshold:
         return 'BUY_CALL'
-    elif sell_score >= 2.5:
+    elif sell_score >= threshold:
         return 'BUY_PUT'
     else:
         return 'HOLD'
